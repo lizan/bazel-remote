@@ -129,13 +129,13 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 	var chunkResp bytestream.ReadResponse
 	for {
 		n, err := rdr.Read(buf)
-		if err == io.EOF {
-			s.accessLogger.Printf("GRPC BYTESTREAM READ COMPLETED %s",
-				req.ResourceName)
+		if err == io.EOF && n == 0 {
+			s.accessLogger.Printf("GRPC BYTESTREAM READ COMPLETED %s %d",
+				req.ResourceName, n)
 			return nil
 		}
 
-		if err != nil {
+		if err != nil && err != io.EOF {
 			msg := fmt.Sprintf("GRPC BYTESTREAM READ FAILED: %v", err)
 			s.accessLogger.Printf(msg)
 			return status.Error(codes.Unknown, msg)

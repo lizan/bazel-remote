@@ -410,9 +410,10 @@ func (c *Cache) Put(kind cache.EntryKind, hash string, expectedSize int64, r io.
 // be requested from the proxy, in which case, a placeholder entry
 // has been added to the index and the caller must either replace
 // the entry with the actual size, or remove it from the LRU.
-func (c *Cache) availableOrTryProxy(key string) (available bool, tryProxy bool) {
+func (c *Cache) availableOrTryProxy(key string) (available bool, tryProxy bool, noCommit bool) {
 	inProgress := false
 	tryProxy = false
+	noCommit = false
 
 	c.mu.Lock()
 
@@ -434,7 +435,12 @@ func (c *Cache) availableOrTryProxy(key string) (available bool, tryProxy bool) 
 
 	available = found && !inProgress
 
-	return available, tryProxy
+	if inProgress && c.proxy != nil {
+		tryProxy = true
+		noCommit = true
+	}
+
+	return available, tryProxy, noCommit
 }
 
 // Get returns an io.ReadCloser with the content of the cache item stored under `hash`
@@ -459,7 +465,7 @@ func (c *Cache) Get(kind cache.EntryKind, hash string, size int64) (io.ReadClose
 	var err error
 	key := cacheKey(kind, hash)
 
-	available, tryProxy := c.availableOrTryProxy(key)
+	available, tryProxy, noCommit := c.availableOrTryProxy(key)
 
 	if available {
 		blobPath := cacheFilePath(kind, c.dir, hash)
@@ -500,39 +506,48 @@ func (c *Cache) Get(kind cache.EntryKind, hash string, size int64) (io.ReadClose
 	// Before returning, we have to either commit the item and set
 	// its size, or remove the item from the LRU.
 	defer func() {
-		c.mu.Lock()
+		if !noCommit {
+			c.mu.Lock()
 
-		if shouldCommit {
-			// Overwrite the placeholder inserted by availableOrTryProxy.
-			// Call Add instead of updating the entry directly, so we
-			// update the currentSize value.
-			c.lru.Add(key, &lruItem{
-				size:      foundSize,
-				committed: true,
-			})
-		} else {
-			// Remove the placeholder.
-			c.lru.Remove(key)
+			if shouldCommit {
+				// Overwrite the placeholder inserted by availableOrTryProxy.
+				// Call Add instead of updating the entry directly, so we
+				// update the currentSize value.
+				c.lru.Add(key, &lruItem{
+					size:      foundSize,
+					committed: true,
+				})
+			} else {
+				// Remove the placeholder.
+				c.lru.Remove(key)
+			}
+
+			c.mu.Unlock()
+
+			if !shouldCommit && tmpFileCreated {
+				os.Remove(tmpFilePath) // No need to check the error.
+			}
+
+			f.Close() // No need to check the error.
 		}
-
-		c.mu.Unlock()
-
-		if !shouldCommit && tmpFileCreated {
-			os.Remove(tmpFilePath) // No need to check the error.
-		}
-
-		f.Close() // No need to check the error.
 	}()
 
 	r, foundSize, err := c.proxy.Get(kind, hash)
-	if r != nil {
-		defer r.Close()
+	if !noCommit && r != nil {
+		defer func() {
+			if !noCommit {
+				r.Close()
+			}
+		}()
 	}
 	if err != nil || r == nil {
 		return nil, -1, err
 	}
 	if isSizeMismatch(size, foundSize) {
 		return nil, -1, nil
+	}
+	if noCommit {
+		return r, foundSize, err
 	}
 
 	f, err = os.Create(tmpFilePath)
